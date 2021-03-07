@@ -1,2 +1,2 @@
-# TensorSelf
-Self-Supervised Learning and Self-Clustering
+# HiSSL
+Hi, Self-Supervised Learning.

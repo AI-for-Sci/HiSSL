@@ -432,7 +432,7 @@ def preprocess_for_train(image,
                          height,
                          width,
                          color_distort=True,
-                         crop=True,
+                         crop=False,
                          flip=True,
                          impl='simclrv2'):
     """Preprocesses the given image for training.

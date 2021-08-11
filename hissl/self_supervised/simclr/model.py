@@ -21,8 +21,8 @@ from absl import flags
 from hissl.utils import data_util
 from hissl.self_supervised.optimizers import lars_optimizer
 from hissl.self_supervised.networks import resnet
-import tensorflow.compat.v2 as tf
-
+# import tensorflow.compat.v2 as tf
+import tensorflow as tf
 FLAGS = flags.FLAGS
 
 

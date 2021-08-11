@@ -18,20 +18,24 @@
 import json
 import math
 import os
-import tensorflow.compat.v2 as tf
+import numpy as np
+# import tensorflow.compat.v2 as tf
+import tensorflow as tf
 import tensorflow_datasets as tfds
 from absl import app
 from absl import flags
 from absl import logging
+from tensorflow.keras import datasets
 
 import sys
+
 sys.path.append("../../")
 
 from hissl.self_supervised.data import data as data_lib
 from hissl.self_supervised.metrics import metrics
 from hissl.self_supervised.simclr import model as model_lib
 from hissl.self_supervised.losses import simclr_objective as obj_lib
-
+from hissl.self_supervised.data.data import get_preprocess_fn
 
 FLAGS = flags.FLAGS
 
@@ -351,14 +355,15 @@ def json_serializable(val):
         return False
 
 
-def perform_evaluation(model, builder, eval_steps, ckpt, strategy, topology):
+def perform_evaluation(model, builder, eval_steps, ckpt, strategy, topology, ds=None):
     """Perform evaluation."""
     if FLAGS.train_mode == 'pretrain' and not FLAGS.lineareval_while_pretraining:
         logging.info('Skipping eval during pretraining without linear eval.')
         return
     # Build input pipeline.
-    ds = data_lib.build_distributed_dataset(builder, FLAGS.eval_batch_size, False,
-                                            strategy, topology)
+    if ds is None:
+        ds = data_lib.build_distributed_dataset(builder, FLAGS.eval_batch_size, False,
+                                                strategy, topology)
     summary_writer = tf.summary.create_file_writer(FLAGS.model_dir)
 
     # Build metrics.
@@ -467,15 +472,98 @@ def _restore_latest_or_from_pretrain(checkpoint_manager):
                 x.assign(tf.zeros_like(x))
 
 
+def build_input_fn(x_train, y_train, global_batch_size, topology, is_training):
+    """Build input function.
+    Args:
+      builder: TFDS builder for specified dataset.
+      global_batch_size: Global batch size.
+      topology: An instance of `tf.tpu.experimental.Topology` or None.
+      is_training: Whether to build in training mode.
+    Returns:
+      A function that accepts a dict of params and returns a tuple of images and
+      features, to be used as the input_fn in TPUEstimator.
+    """
+
+    def _input_fn(input_context):
+        """Inner input function."""
+        batch_size = input_context.get_per_replica_batch_size(global_batch_size)
+        logging.info('Global batch size: %d', global_batch_size)
+        logging.info('Per-replica batch size: %d', batch_size)
+        preprocess_fn_pretrain = get_preprocess_fn(is_training, is_pretrain=True)
+        preprocess_fn_finetune = get_preprocess_fn(is_training, is_pretrain=False)
+        num_classes = np.unique(y_train)  # builder.info.features['label'].num_classes
+
+        def map_fn(image, label):
+            # 2021-08-11 mnist原始的格式为(768, 1)， 需要转换为(28, 28, 1)
+            image = tf.concat([image, image, image], axis=-1)
+            print("image: ", image.shape)
+            """Produces multiple transformations of the same batch."""
+            if is_training and FLAGS.train_mode == 'pretrain':
+                xs = []
+                for _ in range(2):  # Two transformations
+                    xs.append(preprocess_fn_pretrain(image))
+                image = tf.concat(xs, -1)
+            else:
+                image = preprocess_fn_finetune(image)
+            label = tf.one_hot(label, num_classes)
+            return image, label
+
+        logging.info('num_input_pipelines: %d', input_context.num_input_pipelines)
+        # dataset = builder.as_dataset(
+        #     split=FLAGS.train_split if is_training else FLAGS.eval_split,
+        #     shuffle_files=is_training,
+        #     as_supervised=True,
+        #     # Passing the input_context to TFDS makes TFDS read different parts
+        #     # of the dataset on different workers. We also adjust the interleave
+        #     # parameters to achieve better performance.
+        #     read_config=tfds.ReadConfig(
+        #         interleave_cycle_length=32,
+        #         interleave_block_length=1,
+        #         # input_context=input_context   ## 2021-08-11 TypeError: __init__() got an unexpected keyword argument 'input_context'
+        #     ))
+        dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+        if FLAGS.cache_dataset:
+            dataset = dataset.cache()
+        if is_training:
+            options = tf.data.Options()
+            options.experimental_deterministic = False
+            options.experimental_slack = True
+            dataset = dataset.with_options(options)
+            buffer_multiplier = 50 if FLAGS.image_size <= 32 else 10
+            dataset = dataset.shuffle(batch_size * buffer_multiplier)
+            dataset = dataset.repeat(-1)
+        dataset = dataset.map(
+            map_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        dataset = dataset.batch(batch_size, drop_remainder=is_training)
+        dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+        return dataset
+
+    return _input_fn
+
+
+def build_distributed_dataset(x_train, y_train, batch_size, is_training, strategy,
+                              topology):
+    input_fn = build_input_fn(x_train, y_train, batch_size, topology, is_training)
+
+    # 2021-08-11 Issue for tensorflow 2.1.0
+    # AttributeError: 'MirroredStrategy' object has no attribute 'distribute_datasets_from_function'
+    # return strategy.distribute_datasets_from_function(input_fn)
+    return strategy.experimental_distribute_datasets_from_function(input_fn)
+
+
 def main(argv):
     if len(argv) > 1:
         raise app.UsageError('Too many command-line arguments.')
 
-    builder = tfds.builder(FLAGS.dataset, data_dir=FLAGS.data_dir)
-    builder.download_and_prepare()
-    num_train_examples = builder.info.splits[FLAGS.train_split].num_examples
-    num_eval_examples = builder.info.splits[FLAGS.eval_split].num_examples
-    num_classes = builder.info.features['label'].num_classes
+    # 数据比较难下载，改为
+    # builder = tfds.builder(FLAGS.dataset, data_dir=FLAGS.data_dir)
+    # builder.download_and_prepare()
+
+    (x_train, y_train), (x_test, y_test) = datasets.mnist.load_data()
+
+    num_train_examples = len(y_train)  # builder.info.splits[FLAGS.train_split].num_examples
+    num_eval_examples = len(y_test)  # builder.info.splits[FLAGS.eval_split].num_examples
+    num_classes = np.unique(y_train)  # .builder.info.features['label'].num_classes
 
     train_steps = model_lib.get_train_steps(num_train_examples)
     eval_steps = FLAGS.eval_steps or int(
@@ -516,17 +604,26 @@ def main(argv):
     if FLAGS.mode == 'eval':
         for ckpt in tf.train.checkpoints_iterator(
                 FLAGS.model_dir, min_interval_secs=15):
-            result = perform_evaluation(model, builder, eval_steps, ckpt, strategy,
-                                        topology)
+            ds = build_distributed_dataset(x_test, y_test,
+                                           FLAGS.eval_batch_size,
+                                           True,
+                                           strategy,
+                                           topology)
+            result = perform_evaluation(model, None, eval_steps, ckpt, strategy,
+                                        topology, ds=ds)
             if result['global_step'] >= train_steps:
                 logging.info('Eval complete. Exiting...')
                 return
+        pass
     else:
         summary_writer = tf.summary.create_file_writer(FLAGS.model_dir)
         with strategy.scope():
             # Build input pipeline.
-            ds = data_lib.build_distributed_dataset(builder, FLAGS.train_batch_size,
-                                                    True, strategy, topology)
+            ds = build_distributed_dataset(x_train, y_train,
+                                           FLAGS.train_batch_size,
+                                           True,
+                                           strategy,
+                                           topology)
 
             # Build LR schedule and optimizer.
             learning_rate = model_lib.WarmUpAndCosineDecay(FLAGS.learning_rate,
@@ -662,13 +759,18 @@ def main(argv):
             logging.info('Training complete...')
 
         if FLAGS.mode == 'train_then_eval':
-            perform_evaluation(model, builder, eval_steps,
+            ds = build_distributed_dataset(x_test, y_test,
+                                           FLAGS.eval_batch_size,
+                                           True,
+                                           strategy,
+                                           topology)
+            perform_evaluation(model, None, eval_steps,
                                checkpoint_manager.latest_checkpoint, strategy,
-                               topology)
+                               topology, ds=ds)
 
 
 if __name__ == '__main__':
-    tf.compat.v1.enable_v2_behavior()
+    # tf.compat.v1.enable_v2_behavior()
     # For outside compilation of summaries on TPU.
-    tf.config.set_soft_device_placement(True)
+    # tf.config.set_soft_device_placement(True)
     app.run(main)

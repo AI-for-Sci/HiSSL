@@ -42,8 +42,9 @@ from hissl.self_supervised.data.data import get_preprocess_fn
 
 FLAGS = flags.FLAGS
 
+# 2021-08-11 learning_rate 0.3 -> 0.0001
 flags.DEFINE_float(
-    'learning_rate', 0.3,
+    'learning_rate', 0.0001,
     'Initial learning rate per batch size of 256.')
 
 flags.DEFINE_enum(
@@ -726,9 +727,6 @@ def main(argv):
                                           total_loss_metric.result(),
                                           weight_decay_metric.result()
                                           ))
-
-                if step > 300:
-                    break
 
             # Calls to tf.summary.xyz lookup the summary writer resource which is
             # set by the summary writer's context manager.

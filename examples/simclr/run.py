@@ -19,9 +19,12 @@ import json
 import math
 import os
 import numpy as np
-# import tensorflow.compat.v2 as tf
-import tensorflow as tf
-import tensorflow_datasets as tfds
+import tensorflow.compat.v2 as tf
+# import tensorflow_datasets as tfds
+
+# 2021-08-11 只支持 tensorflow 2.1.0
+# import tensorflow as tf
+
 from absl import app
 from absl import flags
 from absl import logging
@@ -66,7 +69,7 @@ flags.DEFINE_string(
     'Split for training.')
 
 flags.DEFINE_integer(
-    'train_epochs', 100,
+    'train_epochs', 10,
     'Number of epochs to train for.')
 
 flags.DEFINE_integer(
@@ -113,7 +116,7 @@ flags.DEFINE_enum(
     'train_mode', 'pretrain', ['pretrain', 'finetune'],
     'The train mode controls different objectives and trainable components.')
 
-flags.DEFINE_bool('lineareval_while_pretraining', True,
+flags.DEFINE_bool('lineareval_while_pretraining', False,
                   'Whether to finetune supervised head while pretraining.')
 
 flags.DEFINE_string(
@@ -247,7 +250,7 @@ flags.DEFINE_boolean(
     'use_blur', True,
     'Whether or not to use Gaussian blur for augmentation during pretraining.')
 
-
+# 简化代码
 def get_salient_tensors_dict(include_projection_head):
     """Returns a dictionary of tensors."""
     graph = tf.compat.v1.get_default_graph()
@@ -327,7 +330,8 @@ def try_restore_from_checkpoint(model, global_step, optimizer):
     if latest_ckpt:
         # Restore model weights, global step, optimizer states
         logging.info('Restoring from latest checkpoint: %s', latest_ckpt)
-        checkpoint_manager.checkpoint.restore(latest_ckpt).expect_partial()
+        # 2021-08-11 修改checkpoint为_checkpoint
+        checkpoint_manager._checkpoint.restore(latest_ckpt).expect_partial()
     elif FLAGS.checkpoint:
         # Restore model weights only, but not global step and optimizer states
         logging.info('Restoring from given checkpoint: %s', FLAGS.checkpoint)
@@ -335,9 +339,9 @@ def try_restore_from_checkpoint(model, global_step, optimizer):
             tf.train.Checkpoint(model=model),
             directory=FLAGS.model_dir,
             max_to_keep=FLAGS.keep_checkpoint_max)
-        checkpoint_manager2.checkpoint.restore(FLAGS.checkpoint).expect_partial()
+        checkpoint_manager2._checkpoint.restore(FLAGS.checkpoint).expect_partial()
         if FLAGS.zero_init_logits_layer:
-            model = checkpoint_manager2.checkpoint.model
+            model = checkpoint_manager2._checkpoint.model
             output_layer_parameters = model.supervised_head.trainable_weights
             logging.info('Initializing output layer parameters %s to zero',
                          [x.op.name for x in output_layer_parameters])
@@ -362,7 +366,7 @@ def perform_evaluation(model, builder, eval_steps, ckpt, strategy, topology, ds=
         return
     # Build input pipeline.
     if ds is None:
-        ds = data_lib.build_distributed_dataset(builder, FLAGS.eval_batch_size, False,
+        ds = build_distributed_dataset(builder, FLAGS.eval_batch_size, False,
                                                 strategy, topology)
     summary_writer = tf.summary.create_file_writer(FLAGS.model_dir)
 
@@ -472,7 +476,7 @@ def _restore_latest_or_from_pretrain(checkpoint_manager):
                 x.assign(tf.zeros_like(x))
 
 
-def build_input_fn(x_train, y_train, global_batch_size, topology, is_training):
+def build_input_fn(x_train, y_train, global_batch_size, topology, is_training, strategy, num_classes=10):
     """Build input function.
     Args:
       builder: TFDS builder for specified dataset.
@@ -484,71 +488,56 @@ def build_input_fn(x_train, y_train, global_batch_size, topology, is_training):
       features, to be used as the input_fn in TPUEstimator.
     """
 
-    def _input_fn(input_context):
-        """Inner input function."""
-        batch_size = input_context.get_per_replica_batch_size(global_batch_size)
-        logging.info('Global batch size: %d', global_batch_size)
-        logging.info('Per-replica batch size: %d', batch_size)
-        preprocess_fn_pretrain = get_preprocess_fn(is_training, is_pretrain=True)
-        preprocess_fn_finetune = get_preprocess_fn(is_training, is_pretrain=False)
-        num_classes = np.unique(y_train)  # builder.info.features['label'].num_classes
+    # def _input_fn(input_context):
+    """Inner input function."""
+    batch_size = global_batch_size // strategy.num_replicas_in_sync  #input_context.get_per_replica_batch_size(global_batch_size)
+    logging.info('Global batch size: %d', global_batch_size)
+    logging.info('Per-replica batch size: %d', batch_size)
+    preprocess_fn_pretrain = get_preprocess_fn(is_training, is_pretrain=True)
+    preprocess_fn_finetune = get_preprocess_fn(is_training, is_pretrain=False)
+    # num_classes = np.unique(y_train)  # builder.info.features['label'].num_classes
 
-        def map_fn(image, label):
-            # 2021-08-11 mnist原始的格式为(768, 1)， 需要转换为(28, 28, 1)
-            image = tf.concat([image, image, image], axis=-1)
-            print("image: ", image.shape)
-            """Produces multiple transformations of the same batch."""
-            if is_training and FLAGS.train_mode == 'pretrain':
-                xs = []
-                for _ in range(2):  # Two transformations
-                    xs.append(preprocess_fn_pretrain(image))
-                image = tf.concat(xs, -1)
-            else:
-                image = preprocess_fn_finetune(image)
-            label = tf.one_hot(label, num_classes)
-            return image, label
+    def map_fn(image, label):
+        """Produces multiple transformations of the same batch."""
+        if is_training and FLAGS.train_mode == 'pretrain':
+            xs = []
+            for _ in range(2):  # Two transformations
+                xs.append(preprocess_fn_pretrain(image))
+            image = tf.concat(xs, -1)
+        else:
+            image = preprocess_fn_finetune(image)
+        label = tf.one_hot(label, num_classes)
+        return image, label
 
-        logging.info('num_input_pipelines: %d', input_context.num_input_pipelines)
-        # dataset = builder.as_dataset(
-        #     split=FLAGS.train_split if is_training else FLAGS.eval_split,
-        #     shuffle_files=is_training,
-        #     as_supervised=True,
-        #     # Passing the input_context to TFDS makes TFDS read different parts
-        #     # of the dataset on different workers. We also adjust the interleave
-        #     # parameters to achieve better performance.
-        #     read_config=tfds.ReadConfig(
-        #         interleave_cycle_length=32,
-        #         interleave_block_length=1,
-        #         # input_context=input_context   ## 2021-08-11 TypeError: __init__() got an unexpected keyword argument 'input_context'
-        #     ))
-        dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train))
-        if FLAGS.cache_dataset:
-            dataset = dataset.cache()
-        if is_training:
-            options = tf.data.Options()
-            options.experimental_deterministic = False
-            options.experimental_slack = True
-            dataset = dataset.with_options(options)
-            buffer_multiplier = 50 if FLAGS.image_size <= 32 else 10
-            dataset = dataset.shuffle(batch_size * buffer_multiplier)
-            dataset = dataset.repeat(-1)
-        dataset = dataset.map(
-            map_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-        dataset = dataset.batch(batch_size, drop_remainder=is_training)
-        dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
-        return dataset
+    dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+    if FLAGS.cache_dataset:
+        dataset = dataset.cache()
+    if is_training:
+        options = tf.data.Options()
+        options.experimental_deterministic = False
+        options.experimental_slack = True
+        dataset = dataset.with_options(options)
+        buffer_multiplier = 50 if FLAGS.image_size <= 32 else 10
+        dataset = dataset.shuffle(batch_size * buffer_multiplier)
+        # dataset = dataset.repeat(-1)
+    dataset = dataset.map(
+        map_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    dataset = dataset.batch(batch_size, drop_remainder=is_training)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+    return dataset
 
-    return _input_fn
+    # return _input_fn
 
 
 def build_distributed_dataset(x_train, y_train, batch_size, is_training, strategy,
                               topology):
-    input_fn = build_input_fn(x_train, y_train, batch_size, topology, is_training)
+    input_fn = build_input_fn(x_train, y_train, batch_size, topology, is_training, strategy)
 
     # 2021-08-11 Issue for tensorflow 2.1.0
     # AttributeError: 'MirroredStrategy' object has no attribute 'distribute_datasets_from_function'
     # return strategy.distribute_datasets_from_function(input_fn)
-    return strategy.experimental_distribute_datasets_from_function(input_fn)
+    # print("input_fn: ", input_fn)
+    return input_fn #strategy.experimental_distribute_dataset(input_fn)
 
 
 def main(argv):
@@ -559,7 +548,25 @@ def main(argv):
     # builder = tfds.builder(FLAGS.dataset, data_dir=FLAGS.data_dir)
     # builder.download_and_prepare()
 
+    # 简化数据输入，只测试 mnist 和 fashion-mnist
     (x_train, y_train), (x_test, y_test) = datasets.mnist.load_data()
+    # reshape
+    x_train = x_train.reshape(x_train.shape[0], 28, 28, 1)
+    x_test = x_test.reshape(x_test.shape[0], 28, 28, 1)
+    # convert from int to float
+    x_train = x_train.astype('float32')
+    x_test = x_test.astype('float32')
+    # rescale values
+    x_train /= 255.0
+    x_test /= 255.0
+
+    # print("x_train: ", x_train[0])
+
+    x_train = tf.concat([x_train, x_train, x_train], axis=-1)
+    print("image: ", x_train.shape)
+    x_test = tf.concat([x_test, x_test, x_test], axis=-1)
+    print("image: ", x_test.shape)
+
 
     num_train_examples = len(y_train)  # builder.info.splits[FLAGS.train_split].num_examples
     num_eval_examples = len(y_test)  # builder.info.splits[FLAGS.eval_split].num_examples
@@ -578,195 +585,212 @@ def main(argv):
     checkpoint_steps = (
             FLAGS.checkpoint_steps or (FLAGS.checkpoint_epochs * epoch_steps))
 
+    logging.info('# checkpoint_steps: %d', checkpoint_steps)
+
     topology = None
-    if FLAGS.use_tpu:
-        if FLAGS.tpu_name:
-            cluster = tf.distribute.cluster_resolver.TPUClusterResolver(
-                FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
-        else:
-            cluster = tf.distribute.cluster_resolver.TPUClusterResolver(FLAGS.master)
-        tf.config.experimental_connect_to_cluster(cluster)
-        topology = tf.tpu.experimental.initialize_tpu_system(cluster)
-        logging.info('Topology:')
-        logging.info('num_tasks: %d', topology.num_tasks)
-        logging.info('num_tpus_per_task: %d', topology.num_tpus_per_task)
-        strategy = tf.distribute.TPUStrategy(cluster)
+    # 简化代码
+    # For (multiple) GPUs.
+    strategy = tf.distribute.MirroredStrategy()
+    logging.info('Running using MirroredStrategy on %d replicas',
+                 strategy.num_replicas_in_sync)
 
-    else:
-        # For (multiple) GPUs.
-        strategy = tf.distribute.MirroredStrategy()
-        logging.info('Running using MirroredStrategy on %d replicas',
-                     strategy.num_replicas_in_sync)
-
-    with strategy.scope():
-        model = model_lib.Model(num_classes)
+    # 简化代码，不支持多GPU，减少痛苦
+    # with strategy.scope():
+    #     model = model_lib.Model(num_classes)
+    model = model_lib.Model(num_classes)
 
     if FLAGS.mode == 'eval':
-        for ckpt in tf.train.checkpoints_iterator(
-                FLAGS.model_dir, min_interval_secs=15):
-            ds = build_distributed_dataset(x_test, y_test,
-                                           FLAGS.eval_batch_size,
-                                           True,
-                                           strategy,
-                                           topology)
-            result = perform_evaluation(model, None, eval_steps, ckpt, strategy,
-                                        topology, ds=ds)
-            if result['global_step'] >= train_steps:
-                logging.info('Eval complete. Exiting...')
-                return
+        # for ckpt in tf.train.checkpoints_iterator(
+        #         FLAGS.model_dir, min_interval_secs=15):
+        #     ds = build_distributed_dataset(x_test, y_test,
+        #                                    FLAGS.eval_batch_size,
+        #                                    True,
+        #                                    strategy,
+        #                                    topology)
+        #     result = perform_evaluation(model, None, eval_steps, ckpt, strategy,
+        #                                 topology, ds=ds)
+        #     if result['global_step'] >= train_steps:
+        #         logging.info('Eval complete. Exiting...')
+        #         return
         pass
     else:
         summary_writer = tf.summary.create_file_writer(FLAGS.model_dir)
-        with strategy.scope():
-            # Build input pipeline.
-            ds = build_distributed_dataset(x_train, y_train,
-                                           FLAGS.train_batch_size,
-                                           True,
-                                           strategy,
-                                           topology)
 
-            # Build LR schedule and optimizer.
-            learning_rate = model_lib.WarmUpAndCosineDecay(FLAGS.learning_rate,
-                                                           num_train_examples)
-            optimizer = model_lib.build_optimizer(learning_rate)
+        # 简化，不使用多GPU
+        # with strategy.scope():
+        # Build input pipeline.
+        ds = build_distributed_dataset(x_train, y_train,
+                                       FLAGS.train_batch_size,
+                                       True,
+                                       strategy,
+                                       topology)
 
-            # Build metrics.
-            all_metrics = []  # For summaries.
-            weight_decay_metric = tf.keras.metrics.Mean('train/weight_decay')
-            total_loss_metric = tf.keras.metrics.Mean('train/total_loss')
-            all_metrics.extend([weight_decay_metric, total_loss_metric])
-            if FLAGS.train_mode == 'pretrain':
-                contrast_loss_metric = tf.keras.metrics.Mean('train/contrast_loss')
-                contrast_acc_metric = tf.keras.metrics.Mean('train/contrast_acc')
-                contrast_entropy_metric = tf.keras.metrics.Mean(
-                    'train/contrast_entropy')
-                all_metrics.extend([
-                    contrast_loss_metric, contrast_acc_metric, contrast_entropy_metric
-                ])
-            if FLAGS.train_mode == 'finetune' or FLAGS.lineareval_while_pretraining:
-                supervised_loss_metric = tf.keras.metrics.Mean('train/supervised_loss')
-                supervised_acc_metric = tf.keras.metrics.Mean('train/supervised_acc')
-                all_metrics.extend([supervised_loss_metric, supervised_acc_metric])
+        # Build LR schedule and optimizer.
+        learning_rate = model_lib.WarmUpAndCosineDecay(FLAGS.learning_rate,
+                                                       num_train_examples)
+        optimizer = model_lib.build_optimizer(learning_rate)
 
-            # Restore checkpoint if available.
-            checkpoint_manager = try_restore_from_checkpoint(
-                model, optimizer.iterations, optimizer)
+        # Build metrics.
+        all_metrics = []  # For summaries.
+        weight_decay_metric = tf.keras.metrics.Mean('train/weight_decay')
+        total_loss_metric = tf.keras.metrics.Mean('train/total_loss')
+        all_metrics.extend([weight_decay_metric, total_loss_metric])
+        if FLAGS.train_mode == 'pretrain':
+            contrast_loss_metric = tf.keras.metrics.Mean('train/contrast_loss')
+            contrast_acc_metric = tf.keras.metrics.Mean('train/contrast_acc')
+            contrast_entropy_metric = tf.keras.metrics.Mean(
+                'train/contrast_entropy')
+            all_metrics.extend([
+                contrast_loss_metric, contrast_acc_metric, contrast_entropy_metric
+            ])
+        if FLAGS.train_mode == 'finetune' or FLAGS.lineareval_while_pretraining:
+            supervised_loss_metric = tf.keras.metrics.Mean('train/supervised_loss')
+            supervised_acc_metric = tf.keras.metrics.Mean('train/supervised_acc')
+            all_metrics.extend([supervised_loss_metric, supervised_acc_metric])
+
+        # Restore checkpoint if available.
+        checkpoint_manager = try_restore_from_checkpoint(model, optimizer.iterations, optimizer)
 
         steps_per_loop = checkpoint_steps
+        # with strategy.scope():
+        for epoch in range(FLAGS.train_epochs):
+            print("Epoch: ", epoch, '=============================================================')
+            weight_decay_metric.reset_states()
+            total_loss_metric.reset_states()
+            if FLAGS.train_mode == 'pretrain':
+                contrast_loss_metric.reset_states()
+                contrast_acc_metric.reset_states()
+                contrast_entropy_metric.reset_states()
 
-        def single_step(features, labels):
-            with tf.GradientTape() as tape:
-                # Log summaries on the last step of the training loop to match
-                # logging frequency of other scalar summaries.
-                #
-                # Notes:
-                # 1. Summary ops on TPUs get outside compiled so they do not affect
-                #    performance.
-                # 2. Summaries are recorded only on replica 0. So effectively this
-                #    summary would be written once per host when should_record == True.
-                # 3. optimizer.iterations is incremented in the call to apply_gradients.
-                #    So we use  `iterations + 1` here so that the step number matches
-                #    those of scalar summaries.
-                # 4. We intentionally run the summary op before the actual model
-                #    training so that it can run in parallel.
-                should_record = tf.equal((optimizer.iterations + 1) % steps_per_loop, 0)
-                with tf.summary.record_if(should_record):
-                    # Only log augmented images for the first tower.
-                    tf.summary.image(
-                        'image', features[:, :, :, :3], step=optimizer.iterations + 1)
-                projection_head_outputs, supervised_head_outputs = model(
-                    features, training=True)
-                loss = None
-                if projection_head_outputs is not None:
-                    outputs = projection_head_outputs
-                    con_loss, logits_con, labels_con = obj_lib.add_contrastive_loss(
-                        outputs,
-                        hidden_norm=FLAGS.hidden_norm,
-                        temperature=FLAGS.temperature,
-                        strategy=strategy)
-                    if loss is None:
-                        loss = con_loss
-                    else:
-                        loss += con_loss
-                    metrics.update_pretrain_metrics_train(contrast_loss_metric,
-                                                          contrast_acc_metric,
-                                                          contrast_entropy_metric,
-                                                          con_loss, logits_con,
-                                                          labels_con)
-                if supervised_head_outputs is not None:
-                    outputs = supervised_head_outputs
-                    l = labels['labels']
-                    if FLAGS.train_mode == 'pretrain' and FLAGS.lineareval_while_pretraining:
-                        l = tf.concat([l, l], 0)
-                    sup_loss = obj_lib.add_supervised_loss(labels=l, logits=outputs)
-                    if loss is None:
-                        loss = sup_loss
-                    else:
-                        loss += sup_loss
-                    metrics.update_finetune_metrics_train(supervised_loss_metric,
-                                                          supervised_acc_metric, sup_loss,
-                                                          l, outputs)
-                weight_decay = model_lib.add_weight_decay(
-                    model, adjust_per_optimizer=True)
-                weight_decay_metric.update_state(weight_decay)
-                loss += weight_decay
-                total_loss_metric.update_state(loss)
-                # The default behavior of `apply_gradients` is to sum gradients from all
-                # replicas so we divide the loss by the number of replicas so that the
-                # mean gradient is applied.
-                loss = loss / strategy.num_replicas_in_sync
-                logging.info('Trainable variables:')
-                for var in model.trainable_variables:
-                    logging.info(var.name)
+            embedding_outputs = np.zeros((int(num_train_examples * 1.2), FLAGS.proj_out_dim), dtype=np.float32)
+            embedding_labels = np.zeros((int(num_train_examples * 1.2)), dtype=np.int32)
+            train_samples = 0
+            for step, (features, labels) in enumerate(ds):
+                with tf.GradientTape() as tape:
+                    # print("Feature: " , features.shape)
+                    projection_head_outputs, supervised_head_outputs = model(
+                        features, training=True)
+                    loss = None
+                    if projection_head_outputs is not None:
+                        outputs = projection_head_outputs
+                        con_loss, logits_con, labels_con = obj_lib.add_contrastive_loss(
+                            outputs,
+                            hidden_norm=FLAGS.hidden_norm,
+                            temperature=FLAGS.temperature,
+                            strategy=strategy)
+                        if loss is None:
+                            loss = con_loss
+                        else:
+                            loss += con_loss
+                        metrics.update_pretrain_metrics_train(contrast_loss_metric,
+                                                              contrast_acc_metric,
+                                                              contrast_entropy_metric,
+                                                              con_loss, logits_con,
+                                                              labels_con)
+
+                        # 记录特征向量和标签
+                        hidden1, hidden2 = tf.split(outputs, 2, 0)
+                        embedding_outputs[train_samples: train_samples + len(features)] = hidden1
+                        embedding_labels[train_samples: train_samples + len(features)] = tf.argmax(labels, axis=-1)
+                        train_samples += len(features)
+                    # if supervised_head_outputs is not None:
+                    #     outputs = supervised_head_outputs
+                    #     l = labels['labels']
+                    #     if FLAGS.train_mode == 'pretrain' and FLAGS.lineareval_while_pretraining:
+                    #         l = tf.concat([l, l], 0)
+                    #     sup_loss = obj_lib.add_supervised_loss(labels=l, logits=outputs)
+                    #     if loss is None:
+                    #         loss = sup_loss
+                    #     else:
+                    #         loss += sup_loss
+                    #     metrics.update_finetune_metrics_train(supervised_loss_metric,
+                    #                                           supervised_acc_metric, sup_loss,
+                    #                                           l, outputs)
+
+                    weight_decay = model_lib.add_weight_decay(
+                        model, adjust_per_optimizer=True)
+                    weight_decay_metric.update_state(weight_decay)
+                    loss += weight_decay
+                    total_loss_metric.update_state(loss)
+                    # The default behavior of `apply_gradients` is to sum gradients from all
+                    # replicas so we divide the loss by the number of replicas so that the
+                    # mean gradient is applied.
+                    loss = loss / strategy.num_replicas_in_sync
                 grads = tape.gradient(loss, model.trainable_variables)
                 optimizer.apply_gradients(zip(grads, model.trainable_variables))
 
-        with strategy.scope():
+                if step % 50 == 0:
+                    template = 'Epoch {}, Step {}, train Loss: {:0.5f}, weight decay: {:0.5f}. '
+                    print(template.format(epoch + 1,
+                                          str(step),
+                                          total_loss_metric.result(),
+                                          weight_decay_metric.result()
+                                          ))
 
-            @tf.function
-            def train_multiple_steps(iterator):
-                # `tf.range` is needed so that this runs in a `tf.while_loop` and is
-                # not unrolled.
-                for _ in tf.range(steps_per_loop):
-                    # Drop the "while" prefix created by tf.while_loop which otherwise
-                    # gets prefixed to every variable name. This does not affect training
-                    # but does affect the checkpoint conversion script.
-                    # TODO(b/161712658): Remove this.
-                    with tf.name_scope(''):
-                        images, labels = next(iterator)
-                        features, labels = images, {'labels': labels}
-                        strategy.experimental_run_v2(single_step, (features, labels))
+                if step > 300:
+                    break
 
-            global_step = optimizer.iterations
-            cur_step = global_step.numpy()
-            iterator = iter(ds)
-            while cur_step < train_steps:
-                # Calls to tf.summary.xyz lookup the summary writer resource which is
-                # set by the summary writer's context manager.
-                with summary_writer.as_default():
-                    train_multiple_steps(iterator)
-                    cur_step = global_step.numpy()
-                    checkpoint_manager.save(cur_step)
-                    logging.info('Completed: %d / %d steps', cur_step, train_steps)
-                    metrics.log_and_write_metrics_to_summary(all_metrics, cur_step)
-                    tf.summary.scalar(
-                        'learning_rate',
-                        learning_rate(tf.cast(global_step, dtype=tf.float32)),
-                        global_step)
-                    summary_writer.flush()
-                for metric in all_metrics:
-                    metric.reset_states()
+            # Calls to tf.summary.xyz lookup the summary writer resource which is
+            # set by the summary writer's context manager.
+            with summary_writer.as_default():
+                checkpoint_manager.save(epoch)
+                logging.info('Completed: %d / %d steps', epoch, train_steps)
+                metrics.log_and_write_metrics_to_summary(all_metrics, epoch)
+                tf.summary.scalar(
+                    'learning_rate',
+                    learning_rate(tf.cast(epoch, dtype=tf.float32)),
+                    epoch)
+                summary_writer.flush()
+            for metric in all_metrics:
+                metric.reset_states()
             logging.info('Training complete...')
 
-        if FLAGS.mode == 'train_then_eval':
-            ds = build_distributed_dataset(x_test, y_test,
-                                           FLAGS.eval_batch_size,
-                                           True,
-                                           strategy,
-                                           topology)
-            perform_evaluation(model, None, eval_steps,
-                               checkpoint_manager.latest_checkpoint, strategy,
-                               topology, ds=ds)
+            import matplotlib.pyplot as plt
+            embedding_outputs = embedding_outputs[:train_samples]
+            embedding_labels = embedding_labels[:train_samples]
+
+            if FLAGS.train_mode == 'pretrain':
+                import umap
+                fit = umap.UMAP()
+                umap = fit.fit_transform(embedding_outputs)
+
+                def pretrain_embedding_plot():
+                    plt.clf()
+                    fig = plt.figure()
+                    fig.subplots_adjust(hspace=0.1, wspace=0.1)
+                    for ii in range(1, 2):
+                        ax = fig.add_subplot(1, 1, ii)
+                        plt.sca(ax)
+                        if ii == 1:
+                            num_labels = len(np.unique(embedding_labels))
+                            if num_labels == 1:
+                                num_labels = 10
+                            print("num_labels: ", num_labels)
+                            plt.scatter(umap[:, 0], umap[:, 1], s=4, alpha=0.5, c=embedding_labels, cmap='Spectral')
+                            plt.gca().set_aspect('equal', 'datalim')
+                            plt.colorbar(boundaries=np.arange(num_labels + 1) - 0.5).set_ticklabels(
+                                np.array(range(num_labels)))
+                            plt.title('Visualizing label through UMAP', fontsize=16);
+                        else:
+                            break
+
+                    save_path = './figures'
+                    if os.path.exists(save_path) is False:
+                        os.mkdir(save_path)
+                    plt.savefig(os.path.join(save_path,'Visualizing label through UMAP_Epoch_{}_SimCLR.png'.format(epoch + 1)))
+
+                # 打印向量Embedding
+                pretrain_embedding_plot()
+
+        # if FLAGS.mode == 'train_then_eval':
+        #     ds = build_distributed_dataset(x_test, y_test,
+        #                                    FLAGS.eval_batch_size,
+        #                                    True,
+        #                                    strategy,
+        #                                    topology)
+        #     perform_evaluation(model, None, eval_steps,
+        #                        checkpoint_manager.latest_checkpoint, strategy,
+        #                        topology, ds=ds)
 
 
 if __name__ == '__main__':

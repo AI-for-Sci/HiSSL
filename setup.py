@@ -30,6 +30,7 @@ setup(
         'numpy',
         'scipy',
         'tensorflow',
+        'umap-learn'
     ],
     # tests_require=['mock'],
     classifiers=[

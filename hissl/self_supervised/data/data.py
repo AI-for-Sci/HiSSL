@@ -50,12 +50,6 @@ def build_input_fn(builder, global_batch_size, topology, is_training):
         num_classes = builder.info.features['label'].num_classes
 
         def map_fn(image, label):
-            # 2021-08-11 mnist原始的格式为(768, 1)， 需要转换为(28, 28, 1)
-            # print("image: ", image.shape)
-            # image = tf.reshape(image,(28, 28, 1))
-            # print("image: ", image.shape)
-            image = tf.concat([image, image, image], axis=-1)
-            print("image: ", image.shape)
             """Produces multiple transformations of the same batch."""
             if is_training and FLAGS.train_mode == 'pretrain':
                 xs = []

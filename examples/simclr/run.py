@@ -19,11 +19,11 @@ import json
 import math
 import os
 import numpy as np
-import tensorflow.compat.v2 as tf
+# import tensorflow.compat.v2 as tf
 # import tensorflow_datasets as tfds
 
 # 2021-08-11 只支持 tensorflow 2.1.0
-# import tensorflow as tf
+import tensorflow as tf
 
 from absl import app
 from absl import flags
@@ -549,6 +549,10 @@ def main(argv):
     # builder = tfds.builder(FLAGS.dataset, data_dir=FLAGS.data_dir)
     # builder.download_and_prepare()
 
+    gpus = tf.config.experimental.list_physical_devices(device_type='GPU')
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
     # 简化数据输入，只测试 mnist 和 fashion-mnist
     (x_train, y_train), (x_test, y_test) = datasets.mnist.load_data()
     # reshape
@@ -598,7 +602,7 @@ def main(argv):
     # 简化代码，不支持多GPU，减少痛苦
     # with strategy.scope():
     #     model = model_lib.Model(num_classes)
-    model = model_lib.Model(num_classes)
+    model = model_lib.Model(num_classes, model_name='lenet')
 
     if FLAGS.mode == 'eval':
         # for ckpt in tf.train.checkpoints_iterator(
@@ -690,8 +694,9 @@ def main(argv):
                                                               labels_con)
 
                         # 记录特征向量和标签
-                        hidden1, hidden2 = tf.split(outputs, 2, 0)
-                        embedding_outputs[train_samples: train_samples + len(features)] = hidden1
+                        z1, z1 = tf.split(outputs, 2, 0)
+                        z1 = tf.math.l2_normalize(z1, axis=-1)
+                        embedding_outputs[train_samples: train_samples + len(features)] = z1
                         embedding_labels[train_samples: train_samples + len(features)] = tf.argmax(labels, axis=-1)
                         train_samples += len(features)
                     # if supervised_head_outputs is not None:
@@ -727,6 +732,9 @@ def main(argv):
                                           total_loss_metric.result(),
                                           weight_decay_metric.result()
                                           ))
+
+                # if step > 300:
+                #     break
 
             # Calls to tf.summary.xyz lookup the summary writer resource which is
             # set by the summary writer's context manager.

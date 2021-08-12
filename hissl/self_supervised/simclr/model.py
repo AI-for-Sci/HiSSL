@@ -20,7 +20,7 @@ from absl import flags
 
 from hissl.utils import data_util
 from hissl.self_supervised.optimizers import lars_optimizer
-from hissl.self_supervised.networks import resnet
+from hissl.self_supervised.networks import resnet, lenet
 # import tensorflow.compat.v2 as tf
 import tensorflow as tf
 FLAGS = flags.FLAGS
@@ -228,12 +228,19 @@ class SupervisedHead(tf.keras.layers.Layer):
 class Model(tf.keras.models.Model):
     """Resnet model with projection or supervised layer."""
 
-    def __init__(self, num_classes, **kwargs):
+    def __init__(self, num_classes, model_name='resnet', **kwargs):
         super(Model, self).__init__(**kwargs)
-        self.resnet_model = resnet.resnet(
-            resnet_depth=FLAGS.resnet_depth,
-            width_multiplier=FLAGS.width_multiplier,
-            cifar_stem=FLAGS.image_size <= 32)
+        if model_name == 'resnet':
+            self.resnet_model = resnet.resnet(
+                resnet_depth=FLAGS.resnet_depth,
+                width_multiplier=FLAGS.width_multiplier,
+                cifar_stem=FLAGS.image_size <= 32)
+        else:
+            self.resnet_model = lenet.LeNet(
+                data_format='channels_last',
+                dropblock_keep_probs=0.95,
+                hidden_size=512
+            )
         self._projection_head = ProjectionHead()
         if FLAGS.train_mode == 'finetune' or FLAGS.lineareval_while_pretraining:
             self.supervised_head = SupervisedHead(num_classes)

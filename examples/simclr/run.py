@@ -44,7 +44,7 @@ FLAGS = flags.FLAGS
 
 # 2021-08-11 learning_rate 0.3 -> 0.0001
 flags.DEFINE_float(
-    'learning_rate', 0.0001,
+    'learning_rate', 0.001,
     'Initial learning rate per batch size of 256.')
 
 flags.DEFINE_enum(
@@ -667,13 +667,11 @@ def main(argv):
                 contrast_acc_metric.reset_states()
                 contrast_entropy_metric.reset_states()
 
-            embedding_outputs = np.zeros((int(num_train_examples * 1.2), FLAGS.proj_out_dim), dtype=np.float32)
-            embedding_labels = np.zeros((int(num_train_examples * 1.2)), dtype=np.int32)
-            train_samples = 0
+
             for step, (features, labels) in enumerate(ds):
                 with tf.GradientTape() as tape:
                     # print("Feature: " , features.shape)
-                    projection_head_outputs, supervised_head_outputs = model(
+                    projection_head_outputs, supervised_head_outputs, hidden = model(
                         features, training=True)
                     loss = None
                     if projection_head_outputs is not None:
@@ -692,13 +690,6 @@ def main(argv):
                                                               contrast_entropy_metric,
                                                               con_loss, logits_con,
                                                               labels_con)
-
-                        # 记录特征向量和标签
-                        z1, z1 = tf.split(outputs, 2, 0)
-                        z1 = tf.math.l2_normalize(z1, axis=-1)
-                        embedding_outputs[train_samples: train_samples + len(features)] = z1
-                        embedding_labels[train_samples: train_samples + len(features)] = tf.argmax(labels, axis=-1)
-                        train_samples += len(features)
                     # if supervised_head_outputs is not None:
                     #     outputs = supervised_head_outputs
                     #     l = labels['labels']
@@ -732,9 +723,26 @@ def main(argv):
                                           total_loss_metric.result(),
                                           weight_decay_metric.result()
                                           ))
-
-                # if step > 300:
-                #     break
+            valid_ds = build_distributed_dataset(x_test, y_test,
+                                                 FLAGS.train_batch_size,
+                                                 False,
+                                                 strategy,
+                                                 topology)
+            embedding_outputs = np.zeros((int(num_eval_examples * 1.2), FLAGS.proj_out_dim * 4), dtype=np.float32)
+            embedding_labels = np.zeros((int(num_eval_examples * 1.2)), dtype=np.int32)
+            valid_samples = 0
+            for step, (features, labels) in enumerate(valid_ds):
+                with tf.GradientTape() as tape:
+                    # print("Feature: " , features.shape)
+                    projection_head_outputs, supervised_head_outputs, hidden = model(
+                        features, training=True)
+                    if hidden is not None:
+                        # 记录特征向量和标签
+                        z1 = hidden
+                        z1 = tf.math.l2_normalize(z1, axis=-1)
+                        embedding_outputs[valid_samples: valid_samples + len(features)] = z1
+                        embedding_labels[valid_samples: valid_samples + len(features)] = tf.argmax(labels, axis=-1)
+                        valid_samples += len(features)
 
             # Calls to tf.summary.xyz lookup the summary writer resource which is
             # set by the summary writer's context manager.
@@ -752,8 +760,8 @@ def main(argv):
             logging.info('Training complete...')
 
             import matplotlib.pyplot as plt
-            embedding_outputs = embedding_outputs[:train_samples]
-            embedding_labels = embedding_labels[:train_samples]
+            embedding_outputs = embedding_outputs[:valid_samples]
+            embedding_labels = embedding_labels[:valid_samples]
 
             if FLAGS.train_mode == 'pretrain':
                 import umap
@@ -762,7 +770,7 @@ def main(argv):
 
                 def pretrain_embedding_plot():
                     plt.clf()
-                    fig = plt.figure()
+                    fig = plt.figure(figsize=(15, 10))
                     fig.subplots_adjust(hspace=0.1, wspace=0.1)
                     for ii in range(1, 2):
                         ax = fig.add_subplot(1, 1, ii)
@@ -772,7 +780,7 @@ def main(argv):
                             if num_labels == 1:
                                 num_labels = 10
                             print("num_labels: ", num_labels)
-                            plt.scatter(umap[:, 0], umap[:, 1], s=4, alpha=0.5, c=embedding_labels, cmap='Spectral')
+                            plt.scatter(umap[:, 0], umap[:, 1], s=2, alpha=0.75, c=embedding_labels, cmap='Spectral')
                             plt.gca().set_aspect('equal', 'datalim')
                             plt.colorbar(boundaries=np.arange(num_labels + 1) - 0.5).set_ticklabels(
                                 np.array(range(num_labels)))

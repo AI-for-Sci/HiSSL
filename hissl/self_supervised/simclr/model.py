@@ -275,13 +275,13 @@ class Model(tf.keras.models.Model):
         if FLAGS.train_mode == 'finetune':
             supervised_head_outputs = self.supervised_head(supervised_head_inputs,
                                                            training)
-            return None, supervised_head_outputs
+            return None, supervised_head_outputs, hiddens
         elif FLAGS.train_mode == 'pretrain' and FLAGS.lineareval_while_pretraining:
             # When performing pretraining and linear evaluation together we do not
             # want information from linear eval flowing back into pretraining network
             # so we put a stop_gradient.
             supervised_head_outputs = self.supervised_head(
                 tf.stop_gradient(supervised_head_inputs), training)
-            return projection_head_outputs, supervised_head_outputs
+            return projection_head_outputs, supervised_head_outputs, hiddens
         else:
-            return projection_head_outputs, None
+            return projection_head_outputs, None, hiddens

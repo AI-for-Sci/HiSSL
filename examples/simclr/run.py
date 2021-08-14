@@ -39,7 +39,7 @@ from hissl.self_supervised.metrics import metrics
 from hissl.self_supervised.simclr import model as model_lib
 from hissl.self_supervised.losses import simclr_objective as obj_lib
 from hissl.self_supervised.data.data import get_preprocess_fn
-
+from hissl.utils.clustering_metrics import ACC as ACCURACY, ARI, NMI
 FLAGS = flags.FLAGS
 
 # 2021-08-11 learning_rate 0.3 -> 0.0001
@@ -541,6 +541,74 @@ def build_distributed_dataset(x_train, y_train, batch_size, is_training, strateg
     return input_fn #strategy.experimental_distribute_dataset(input_fn)
 
 
+def cluster_manifold_in_embedding(hidden_layer,
+                                  y_labels,
+                                  cluster='KM',
+                                  n_clusters=10,
+                                  ):
+    """
+    Clustering on new manifold of embeddings
+    :param hidden_layer:
+    :param y_labels:
+    :param label_names:
+    :param manifold_learner:
+    :param umap_min_distance:
+    :param umap_metric:
+    :param umap_dim:
+    :param umap_neighbors:
+    :param cluster:
+    :param n_clusters:
+    :param dataset_name:
+    :return:
+    """
+
+    # N2D: (Not Too) Deep Clustering via Clustering the Local Manifold of an Autoencoded Embedding
+    # Ryan McConville, Raul Santos-Rodriguez, Robert J Piechocki, Ian Craddock
+    # https://arxiv.org/abs/1908.05968
+    from sklearn.cluster import KMeans, SpectralClustering
+    import random as rn
+    from sklearn import metrics
+    from sklearn import mixture
+
+    rn.seed(0)
+    tf.random.set_seed(0)
+    np.random.seed(0)
+    np.set_printoptions(threshold=sys.maxsize)
+
+    # clustering on new manifold of autoencoded embedding
+    if cluster == 'GMM':
+        gmm = mixture.GaussianMixture(
+            covariance_type='full',
+            n_components=n_clusters,
+            random_state=0)
+        gmm.fit(hidden_layer)
+        y_pred_prob = gmm.predict_proba(hidden_layer)
+        y_pred = y_pred_prob.argmax(1)
+    elif cluster == 'KM':
+        km = KMeans(
+            init='k-means++',
+            n_clusters=n_clusters,
+            random_state=0,
+            n_init=20)
+        y_pred = km.fit_predict(hidden_layer)
+    elif cluster == 'SC':
+        sc = SpectralClustering(
+            n_clusters=n_clusters,
+            random_state=0,
+            affinity='nearest_neighbors')
+        y_pred = sc.fit_predict(hidden_layer)
+
+    y_pred = np.asarray(y_pred, dtype=np.int32)
+    y_true = np.asarray(y_labels, dtype=np.int32)
+    print("y_pred: ", y_pred.shape, y_pred[:10])
+    print("y_true: ", y_true.shape, y_true[:10])
+    acc = ACCURACY(y_true, y_pred)
+    nmi = NMI(y_true, y_pred)
+    ari = ARI(y_true, y_pred)
+
+    return y_pred, acc, nmi, ari
+
+
 def main(argv):
     if len(argv) > 1:
         raise app.UsageError('Too many command-line arguments.')
@@ -723,13 +791,36 @@ def main(argv):
                                           total_loss_metric.result(),
                                           weight_decay_metric.result()
                                           ))
+            # 训练集的Embeddings
+            train_ds = build_distributed_dataset(x_train, y_train,
+                                                 FLAGS.train_batch_size,
+                                                 False,
+                                                 strategy,
+                                                 topology)
+            train_embeddings = np.zeros((int(num_train_examples * 1.2), FLAGS.proj_out_dim * 4), dtype=np.float32)
+            train_labels = np.zeros((int(num_train_examples * 1.2)), dtype=np.int32)
+            train_samples = 0
+            for step, (features, labels) in enumerate(train_ds):
+                with tf.GradientTape() as tape:
+                    # print("Feature: " , features.shape)
+                    projection_head_outputs, supervised_head_outputs, hidden = model(
+                        features, training=True)
+                    if hidden is not None:
+                        # 记录特征向量和标签
+                        z1 = hidden
+                        z1 = tf.math.l2_normalize(z1, axis=-1)
+                        train_embeddings[train_samples: train_samples + len(features)] = z1
+                        train_labels[train_samples: train_samples + len(features)] = tf.argmax(labels, axis=-1)
+                        train_samples += len(features)
+
+            # 验证集的Embeddings
             valid_ds = build_distributed_dataset(x_test, y_test,
                                                  FLAGS.train_batch_size,
                                                  False,
                                                  strategy,
                                                  topology)
-            embedding_outputs = np.zeros((int(num_eval_examples * 1.2), FLAGS.proj_out_dim * 4), dtype=np.float32)
-            embedding_labels = np.zeros((int(num_eval_examples * 1.2)), dtype=np.int32)
+            valid_embeddings = np.zeros((int(num_eval_examples * 1.2), FLAGS.proj_out_dim * 4), dtype=np.float32)
+            valid_labels = np.zeros((int(num_eval_examples * 1.2)), dtype=np.int32)
             valid_samples = 0
             for step, (features, labels) in enumerate(valid_ds):
                 with tf.GradientTape() as tape:
@@ -740,8 +831,8 @@ def main(argv):
                         # 记录特征向量和标签
                         z1 = hidden
                         z1 = tf.math.l2_normalize(z1, axis=-1)
-                        embedding_outputs[valid_samples: valid_samples + len(features)] = z1
-                        embedding_labels[valid_samples: valid_samples + len(features)] = tf.argmax(labels, axis=-1)
+                        valid_embeddings[valid_samples: valid_samples + len(features)] = z1
+                        valid_labels[valid_samples: valid_samples + len(features)] = tf.argmax(labels, axis=-1)
                         valid_samples += len(features)
 
             # Calls to tf.summary.xyz lookup the summary writer resource which is
@@ -760,31 +851,53 @@ def main(argv):
             logging.info('Training complete...')
 
             import matplotlib.pyplot as plt
-            embedding_outputs = embedding_outputs[:valid_samples]
-            embedding_labels = embedding_labels[:valid_samples]
+            train_embeddings = train_embeddings[:train_samples]
+            train_labels = train_labels[:train_samples]
+            valid_embeddings = valid_embeddings[:valid_samples]
+            valid_labels = valid_labels[:valid_samples]
+
+            _, acc, nmi, ari = cluster_manifold_in_embedding(train_embeddings, train_labels)
+            print("acc: ", acc)
+            print("nmi: ", nmi)
+            print("ari: ", ari)
+            print('Train(kmeans): acc = %.5f, nmi = %.5f, ari = %.5f' % (acc, nmi, ari), '.')
+
+            _, acc, nmi, ari = cluster_manifold_in_embedding(valid_embeddings, valid_labels)
+            print('Valid(kmeans): acc = %.5f, nmi = %.5f, ari = %.5f' % (acc, nmi, ari), '.')
 
             if FLAGS.train_mode == 'pretrain':
                 import umap
                 fit = umap.UMAP()
-                umap = fit.fit_transform(embedding_outputs)
+                train_umap = fit.fit_transform(train_embeddings)
+                valid_umap = fit.fit_transform(valid_embeddings)
 
                 def pretrain_embedding_plot():
                     plt.clf()
-                    fig = plt.figure(figsize=(15, 10))
+                    fig = plt.figure(figsize=(20, 10))
                     fig.subplots_adjust(hspace=0.1, wspace=0.1)
-                    for ii in range(1, 2):
-                        ax = fig.add_subplot(1, 1, ii)
+                    for ii in range(1, 3):
+                        ax = fig.add_subplot(1, 2, ii)
                         plt.sca(ax)
-                        if ii == 1:
-                            num_labels = len(np.unique(embedding_labels))
+                        if ii == 2:
+                            num_labels = len(np.unique(valid_labels))
                             if num_labels == 1:
                                 num_labels = 10
                             print("num_labels: ", num_labels)
-                            plt.scatter(umap[:, 0], umap[:, 1], s=2, alpha=0.75, c=embedding_labels, cmap='Spectral')
+                            plt.scatter(valid_umap[:, 0], valid_umap[:, 1], s=2, alpha=0.75, c=valid_labels, cmap='Spectral')
                             plt.gca().set_aspect('equal', 'datalim')
                             plt.colorbar(boundaries=np.arange(num_labels + 1) - 0.5).set_ticklabels(
                                 np.array(range(num_labels)))
-                            plt.title('Visualizing label through UMAP', fontsize=16);
+                            plt.title('Visualizing valid label through UMAP', fontsize=16)
+                        elif ii == 1:
+                            num_labels = len(np.unique(train_labels))
+                            if num_labels == 1:
+                                num_labels = 10
+                            print("num_labels: ", num_labels)
+                            plt.scatter(train_umap[:, 0], train_umap[:, 1], s=2, alpha=0.75, c=train_labels, cmap='Spectral')
+                            plt.gca().set_aspect('equal', 'datalim')
+                            plt.colorbar(boundaries=np.arange(num_labels + 1) - 0.5).set_ticklabels(
+                                np.array(range(num_labels)))
+                            plt.title('Visualizing train label through UMAP', fontsize=16);
                         else:
                             break
 
